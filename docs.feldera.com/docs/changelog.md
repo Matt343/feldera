@@ -14,6 +14,17 @@ import TabItem from '@theme/TabItem';
 
         ## Unreleased
 
+        - The `bloom_false_positive_rate` storage setting now applies when a
+          Bloom filter is read as well as when it is written.  Lowering it and
+          restarting a pipeline reduces Bloom filter memory without rewriting
+          any batches, and raising it again restores the accuracy the batches
+          were written with.  See [Memory management](/operations/memory).
+
+          Batches written at a rate finer than 0.1 use a new filter format, so
+          a checkpoint written by this or a later version cannot be resumed by
+          an earlier version.  Checkpoints written by earlier versions continue
+          to be read.
+
         - Output connectors can be paused, like input connectors: a paused
           output connector discards the output of its view instead of writing it
           to its sink, which lets a pipeline run on while a sink is unavailable.
@@ -50,6 +61,21 @@ import TabItem from '@theme/TabItem';
           `require_tls` and `root_certificates_file` for servers whose
           certificates a private CA signs. See
           [NATS input connector](/connectors/sources/nats).
+
+        - The Delta Lake and Iceberg input connectors read a `VARIANT` column
+          stored in the Parquet variant binary encoding, which is how Delta
+          Lake's `variant` type stores one. Values keep the types the writer
+          encoded, so a date inside a `VARIANT` arrives as a date rather than
+          as a string. A `VARIANT` column stored as JSON text still reads as
+          before, and the two can sit side by side in one table.
+
+        - Breaking change (Delta Lake output connector): a `VARIANT` column is
+          now written as the Delta `variant` type rather than as JSON text in a
+          `string` column, so values keep the types they have in Feldera. Set
+          `variant_encoding` to `json_string` for the previous encoding, which
+          is also what appending to a table whose `VARIANT` column is already a
+          `string` requires. See
+          [VARIANT](/connectors/sinks/delta#variant).
 
         ## v0.337.0
 

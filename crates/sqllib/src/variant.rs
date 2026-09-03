@@ -13,11 +13,10 @@ use feldera_types::serde_with_context::serde_config::VariantFormat;
 use feldera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
 };
-use serde::de::{self, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::ser::{self, Error as _};
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
-use std::borrow::Cow;
 use std::cmp::Ord;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -255,13 +254,8 @@ impl<'de, AUX> DeserializeWithContext<'de, SqlSerdeConfig, AUX> for Variant {
     {
         match context.variant_format {
             VariantFormat::Json => Variant::deserialize(deserializer),
-            VariantFormat::JsonString => {
-                let s = Cow::<String>::deserialize(deserializer)?;
-                serde_json::from_str::<Variant>(&s).map_err(|e| {
-                    D::Error::custom(format!(
-                        "error deserializing VARIANT type from a JSON string: {e}"
-                    ))
-                })
+            VariantFormat::JsonString | VariantFormat::ParquetVariant => {
+                crate::variant_binary::deserialize_variant(deserializer)
             }
         }
     }
@@ -353,6 +347,9 @@ impl SerializeWithContext<SqlSerdeConfig> for Variant {
                     S::Error::custom(format!("error serializing VARIANT to JSON string: {e}"))
                 })?)
             }
+            VariantFormat::ParquetVariant => {
+                crate::variant_binary::serialize_variant(self, serializer)
+            }
             VariantFormat::Json => match self {
                 Variant::SqlNull | Variant::VariantNull => serializer.serialize_none(),
                 Variant::Boolean(v) => v.serialize_with_context(serializer, context),
@@ -388,7 +385,7 @@ impl SerializeWithContext<SqlSerdeConfig> for Variant {
 
 impl Variant {
     /// Get the runtime type of a Variant value
-    fn get_type_string(&self) -> &'static str {
+    pub(crate) fn get_type_string(&self) -> &'static str {
         match self {
             Variant::SqlNull => "NULL",
             Variant::VariantNull => "VARIANT",

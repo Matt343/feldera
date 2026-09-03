@@ -351,3 +351,144 @@ where
         unimplemented!();
     }
 }
+
+#[cfg(test)]
+mod partition_keys_test {
+    use crate::{
+        ZWeight,
+        dynamic::{DowncastTrait, DynData},
+        trace::{BatchReader, BatchReaderFactories, Cursor, SpineSnapshot, partition_sample_size},
+        typed_batch::{DynOrdIndexedZSet, OrdIndexedZSet},
+        utils::Tup2,
+    };
+    use std::sync::Arc;
+
+    type Batch = DynOrdIndexedZSet<DynData, DynData>;
+
+    /// A snapshot of `batches` batches of `keys_per_batch` keys each, laid out
+    /// by `key`, which maps a batch index and an offset within it to a key.
+    fn snapshot(
+        batches: u64,
+        keys_per_batch: u64,
+        key: impl Fn(u64, u64) -> u64,
+    ) -> SpineSnapshot<Batch> {
+        let factories: <Batch as BatchReader>::Factories =
+            BatchReaderFactories::new::<u64, u64, ZWeight>();
+        let batches = (0..batches)
+            .map(|batch| {
+                let tuples = (0..keys_per_batch)
+                    .map(|i| {
+                        let k = key(batch, i);
+                        Tup2(Tup2(k, k), 1)
+                    })
+                    .collect();
+                Arc::new(OrdIndexedZSet::<u64, u64>::from_tuples((), tuples).into_inner())
+            })
+            .collect();
+
+        SpineSnapshot::with_batches(&factories, batches)
+    }
+
+    /// Keys of every batch spread over the whole key range, as they are when a
+    /// spine groups its batches by arrival time and the keys do not correlate
+    /// with arrival.
+    fn interleaved(batches: u64) -> impl Fn(u64, u64) -> u64 {
+        move |batch, i| i * batches + batch
+    }
+
+    /// Each batch holding one contiguous run of keys, as they are when the key
+    /// grows with arrival: a timestamp, or a sequence number.
+    fn contiguous(keys_per_batch: u64) -> impl Fn(u64, u64) -> u64 {
+        move |batch, i| batch * keys_per_batch + i
+    }
+
+    /// Partitions `snapshot` and returns the size of each range.
+    fn partition(snapshot: &SpineSnapshot<Batch>, partitions: usize) -> Vec<u64> {
+        let mut bounds = snapshot.factories().keys_factory().default_box();
+        snapshot.partition_keys(partitions, bounds.as_mut());
+        assert_eq!(bounds.len(), partitions - 1);
+
+        let mut sizes = vec![0u64; partitions];
+        let mut cursor = snapshot.cursor();
+        while cursor.key_valid() {
+            let key = *cursor.key().downcast_checked::<u64>();
+            let range = (0..partitions - 1)
+                .find(|&i| key < *bounds.index(i).downcast_checked::<u64>())
+                .unwrap_or(partitions - 1);
+            sizes[range] += 1;
+            cursor.step_key();
+        }
+        assert_eq!(sizes.iter().sum::<u64>(), snapshot.key_count() as u64);
+        sizes
+    }
+
+    #[track_caller]
+    fn assert_within(sizes: &[u64], multiple_of_an_even_split: u64) {
+        let total: u64 = sizes.iter().sum();
+        let largest = *sizes.iter().max().unwrap();
+        assert!(
+            largest * sizes.len() as u64 <= total * multiple_of_an_even_split,
+            "largest range holds {largest} of {total} keys: {sizes:?}"
+        );
+    }
+
+    /// `partition_keys` returns a full set of boundaries, cutting ranges of
+    /// comparable size, over a snapshot of many small batches.
+    ///
+    /// The snapshot holds more batches than the sample holds draws and no batch
+    /// reaches a full share of it, so each batch contributes at most one key.
+    #[test]
+    fn a_snapshot_of_many_small_batches_yields_every_boundary() {
+        const BATCHES: u64 = 200;
+        const KEYS_PER_BATCH: u64 = 500;
+        const PARTITIONS: usize = 12;
+
+        let snapshot = snapshot(BATCHES, KEYS_PER_BATCH, interleaved(BATCHES));
+        assert_eq!(snapshot.key_count() as u64, BATCHES * KEYS_PER_BATCH);
+        assert!(KEYS_PER_BATCH < snapshot.key_count() as u64 / PARTITIONS.pow(2) as u64);
+
+        assert_within(&partition(&snapshot, PARTITIONS), 3);
+    }
+
+    /// A batch large enough for the sample size to come from the accuracy term
+    /// rather than the floor still partitions evenly, so the split does not
+    /// depend on `partition_keys` happening to fall back to its floor.
+    #[test]
+    fn a_snapshot_sampled_above_the_floor_partitions_evenly() {
+        const BATCHES: u64 = 50;
+        const KEYS_PER_BATCH: u64 = 4_000;
+        const PARTITIONS: usize = 6;
+
+        let snapshot = snapshot(BATCHES, KEYS_PER_BATCH, interleaved(BATCHES));
+        let sample_size = partition_sample_size(snapshot.key_count(), PARTITIONS);
+        assert!(
+            sample_size > PARTITIONS.pow(2),
+            "fixture is meant to be sampled above the floor, drew {sample_size}"
+        );
+
+        assert_within(&partition(&snapshot, PARTITIONS), 3);
+    }
+
+    /// A snapshot whose batches each hold one contiguous run of keys partitions
+    /// as evenly as one whose batches are spread over the key range.
+    ///
+    /// The sample is smaller than the batch count here, so most batches draw
+    /// nothing. Which ones matters: where the batches divide the key range
+    /// between them, a run of undrawn batches at one end of that range leaves
+    /// its keys with no boundary to fall between, and they all land in one
+    /// partition.
+    #[test]
+    fn a_snapshot_of_contiguous_batches_partitions_evenly() {
+        const BATCHES: u64 = 200;
+        const KEYS_PER_BATCH: u64 = 500;
+        const PARTITIONS: usize = 12;
+
+        let snapshot = snapshot(BATCHES, KEYS_PER_BATCH, contiguous(KEYS_PER_BATCH));
+        assert!(
+            partition_sample_size(snapshot.key_count(), PARTITIONS) < BATCHES as usize,
+            "the sample is meant to be too small to reach every batch"
+        );
+
+        assert_within(&partition(&snapshot, PARTITIONS), 3);
+    }
+}
